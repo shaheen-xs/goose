@@ -1,76 +1,87 @@
-# syntax=docker/dockerfile:1.4
-# goose CLI and Server Docker Image
-# Multi-stage build for minimal final image size
+# ============================================================================
+# المرحلة الأولى: البناء (Builder Stage)
+# ============================================================================
+FROM rust:1.94.1 as builder
 
-# Build stage
-FROM rust:1.82-bookworm AS builder
+# تحسين الأداء والبناء
+ENV CARGO_INCREMENTAL=0 \
+    RUST_MIN_STACK=8388608 \
+    RUSTFLAGS="-C opt-level=3 -C lto=thin" \
+    CARGO_TERM_COLOR=always
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    pkg-config \
-    libssl-dev \
+# تثبيت المتطلبات النظام للبناء
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libdbus-1-dev \
-    libclang-dev \
-    protobuf-compiler \
-    libprotobuf-dev \
+    libxcb1-dev \
+    pkg-config \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /build
 
-# Copy source code
-COPY . .
+# نسخ ملفات المشروع (تحسين الـ Cache)
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY vendor ./vendor
 
-# Build release binaries with optimizations
-ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
-ENV CARGO_PROFILE_RELEASE_LTO=true
-ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=z
-ENV CARGO_PROFILE_RELEASE_STRIP=true
-RUN cargo build --release --package goose-cli
+# بناء المشروع في وضع الإصدار
+RUN cargo build --release --locked 2>&1 | tail -30
 
-# Runtime stage - minimal Debian
-FROM debian:bookworm-slim@sha256:b1a741487078b369e78119849663d7f1a5341ef2768798f7b7406c4240f86aef
+# ============================================================================
+# المرحلة الثانية: التشغيل (Runtime Stage)
+# ============================================================================
+FROM debian:bookworm-slim
 
-# Install only runtime dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
+LABEL maintainer="Goose Team" \
+      version="1.50.0" \
+      description="Open source AI agent for code, workflows, and automation" \
+      github="https://github.com/aaif-goose/goose"
+
+# تثبيت المتطلبات التشغيل فقط
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libdbus-1-3 \
-    libgomp1 \
     libxcb1 \
+    ca-certificates \
     curl \
-    git \
-    && apt-get clean \
+    bash \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy binary from builder
-COPY --from=builder /build/target/release/goose /usr/local/bin/goose
-
-# Create non-root user
-RUN useradd -m -u 1000 -s /bin/bash goose && \
-    mkdir -p /home/goose/.config/goose && \
+# إنشاء مستخدم غير root لـ security
+RUN useradd -m -u 1000 goose && \
     chown -R goose:goose /home/goose
 
-# Set up environment
-ENV PATH="/usr/local/bin:${PATH}"
-ENV HOME="/home/goose"
+WORKDIR /app
 
-# Switch to non-root user
+# نسخ البينري من مرحلة البناء
+COPY --from=builder /build/target/release/goose /usr/local/bin/goose
+
+# إنشاء مجلدات البيانات الدائمة وتعيين الأذونات
+RUN mkdir -p /app/config /app/data /app/cache && \
+    chown -R goose:goose /app && \
+    chmod 750 /app/config /app/data /app/cache
+
+# تبديل للمستخدم غير root
 USER goose
-WORKDIR /home/goose
 
-# Default to goose CLI
-ENTRYPOINT ["/usr/local/bin/goose"]
-CMD ["--help"]
+# تعيين المنفذ
+EXPOSE 3000
 
-# Labels for metadata
-LABEL org.opencontainers.image.title="goose"
-LABEL org.opencontainers.image.description="goose CLI"
-LABEL org.opencontainers.image.vendor="AAIF"
-LABEL org.opencontainers.image.source="https://github.com/aaif-goose/goose"
+# متغيرات البيئة الافتراضية
+ENV RUST_LOG=info,goose=debug \
+    GOOSE_ADDR=0.0.0.0 \
+    PORT=3000 \
+    PATH=/usr/local/bin:$PATH \
+    GOOSE_CONFIG_HOME=/app/config \
+    GOOSE_DATA_HOME=/app/data \
+    GOOSE_CACHE_DIR=/app/cache
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# استخدام tini لـ proper signal handling
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# تشغيل التطبيق
+CMD ["goose"]
